@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -105,12 +106,12 @@ func main() {
 
 	listener, err := net.Listen("tcp", port)
 	if err != nil {
-		fmt.Println("Khong the mo port 9000:", err)
+		fmt.Println("Khong the mo port", port, ":", err)
 		return
 	}
 	defer listener.Close()
 
-	fmt.Println("Server Go multiplayer da chay tren", port)
+	fmt.Printf("Server Go multiplayer da chay tren PORT=%s bind=%s\n", strings.TrimPrefix(port, ":"), port)
 
 	for {
 		conn, err := listener.Accept()
@@ -163,6 +164,14 @@ func handleClient(client *Client) {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
+		}
+
+		if strings.HasPrefix(strings.ToUpper(line), "GET ") || strings.HasPrefix(strings.ToUpper(line), "HEAD ") {
+			parts := strings.Fields(line)
+			if len(parts) >= 2 && (parts[1] == "/health" || parts[1] == "/") {
+				_ = sendHealthResponse(client.Conn)
+				return
+			}
 		}
 
 		fmt.Printf("Nhan tu %s: %s\n", client.Conn.RemoteAddr().String(), line)
@@ -239,6 +248,17 @@ func handleClient(client *Client) {
 			broadcastDamage(packet.AttackerID, packet.TargetID, packet.Damage)
 		}
 	}
+}
+
+func sendHealthResponse(conn net.Conn) error {
+	body := `{"status":"ok"}`
+	response := "HTTP/1.1 200 OK\r\n" +
+		"Content-Type: application/json\r\n" +
+		"Content-Length: " + strconv.Itoa(len(body)) + "\r\n" +
+		"Connection: close\r\n\r\n" +
+		body
+	_, err := conn.Write([]byte(response))
+	return err
 }
 
 func broadcastJoin(state PlayerState) {
