@@ -1,14 +1,14 @@
 package main
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
-	"net"
+	"net/http"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/gorilla/websocket"
 )
 
 const defaultPort = ":9000"
@@ -44,16 +44,22 @@ type Packet struct {
 }
 
 type Client struct {
-	Conn  net.Conn
+	Conn  *websocket.Conn
 	State PlayerState
 }
 
 var (
-	clients      = make(map[net.Conn]*Client)
+	clients      = make(map[*websocket.Conn]*Client)
 	mu           sync.RWMutex
 	nextClientID int
 	store        *PostgresStore
 )
+
+var upgrader = websocket.Upgrader{
+	ReadBufferSize:  4096,
+	WriteBufferSize: 4096,
+	CheckOrigin:     func(r *http.Request) bool { return true },
+}
 
 func loadEnv() (string, string) {
 	databaseURL := os.Getenv("DATABASE_URL")
@@ -104,38 +110,46 @@ func main() {
 		return
 	}
 
-	listener, err := net.Listen("tcp", port)
+	http.HandleFunc("/", healthHandler)
+	http.HandleFunc("/health", healthHandler)
+	http.HandleFunc("/ws", wsHandler)
+
+	fmt.Printf("Server Go multiplayer da chay tren PORT=%s\n", strings.TrimPrefix(port, ":"))
+	if err := http.ListenAndServe(port, nil); err != nil {
+		fmt.Println("Server loi:", err)
+	}
+}
+
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{"status":"ok"}`))
+}
+
+func wsHandler(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		fmt.Println("Khong the mo port", port, ":", err)
+		fmt.Println("WebSocket upgrade loi:", err)
 		return
 	}
-	defer listener.Close()
 
-	fmt.Printf("Server Go multiplayer da chay tren PORT=%s bind=%s\n", strings.TrimPrefix(port, ":"), port)
-
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			fmt.Println("Accept loi:", err)
-			continue
-		}
-
-		mu.Lock()
-		nextClientID++
-		client := &Client{
-			Conn: conn,
-			State: PlayerState{
-				ID:   fmt.Sprintf("player_%d", nextClientID),
-				Name: "Player",
-				Y:    1.2,
-			},
-		}
-		clients[conn] = client
-		mu.Unlock()
-
-		fmt.Println("Client ket noi:", conn.RemoteAddr().String())
-		go handleClient(client)
+	mu.Lock()
+	nextClientID++
+	client := &Client{
+		Conn: conn,
+		State: PlayerState{
+			ID:   fmt.Sprintf("player_%d", nextClientID),
+			Name: "Player",
+			Y:    1.2,
+		},
 	}
+	clients[conn] = client
+	mu.Unlock()
+
+	fmt.Println("Client ket noi:", conn.RemoteAddr())
+
+	sendPacket(conn, Packet{Type: "welcome", Player: client.State})
+	handleClient(client)
 }
 
 func handleClient(client *Client) {
@@ -147,34 +161,19 @@ func handleClient(client *Client) {
 		client.Conn.Close()
 	}()
 
-	reader := bufio.NewReader(client.Conn)
-
-	if err := sendPacket(client.Conn, Packet{Type: "welcome", Player: client.State}); err != nil {
-		fmt.Println("Gui welcome loi:", err)
-		return
-	}
-
 	for {
-		line, err := reader.ReadString('\n')
+		_, message, err := client.Conn.ReadMessage()
 		if err != nil {
-			fmt.Println("Client ngat ket noi:", client.Conn.RemoteAddr().String(), err)
+			fmt.Println("Client ngat ket noi:", client.Conn.RemoteAddr(), err)
 			return
 		}
 
-		line = strings.TrimSpace(line)
+		line := strings.TrimSpace(string(message))
 		if line == "" {
 			continue
 		}
 
-		if strings.HasPrefix(strings.ToUpper(line), "GET ") || strings.HasPrefix(strings.ToUpper(line), "HEAD ") {
-			parts := strings.Fields(line)
-			if len(parts) >= 2 && (parts[1] == "/health" || parts[1] == "/") {
-				_ = sendHealthResponse(client.Conn)
-				return
-			}
-		}
-
-		fmt.Printf("Nhan tu %s: %s\n", client.Conn.RemoteAddr().String(), line)
+		fmt.Printf("Nhan tu %s: %s\n", client.Conn.RemoteAddr(), line)
 
 		var packet Packet
 		if err := json.Unmarshal([]byte(line), &packet); err != nil {
@@ -186,7 +185,7 @@ func handleClient(client *Client) {
 		case "login":
 			state, inventory, err := store.LoginOrCreateAccount(packet.Player.Username, packet.Player.Password)
 			if err != nil {
-				_ = sendPacket(client.Conn, Packet{Type: "error", Error: err.Error()})
+				sendPacket(client.Conn, Packet{Type: "error", Error: err.Error()})
 				continue
 			}
 			client.State = state
@@ -199,14 +198,8 @@ func handleClient(client *Client) {
 			if err := store.UpsertPlayerState(client.State); err != nil {
 				fmt.Println("Luu player state loi:", err)
 			}
-			if err := sendPacket(client.Conn, Packet{Type: "welcome", Player: client.State, Inventory: inventory}); err != nil {
-				fmt.Println("Gui welcome sau login loi:", err)
-				return
-			}
-			if err := sendSnapshot(client.Conn, client.State.RoomID, client.State.MatchID); err != nil {
-				fmt.Println("Gui snapshot sau login loi:", err)
-				return
-			}
+			sendPacket(client.Conn, Packet{Type: "welcome", Player: client.State, Inventory: inventory})
+			sendSnapshot(client.Conn, client.State.RoomID, client.State.MatchID)
 			broadcastJoin(client.State)
 		case "join":
 			if packet.Player.Name != "" {
@@ -250,28 +243,12 @@ func handleClient(client *Client) {
 	}
 }
 
-func sendHealthResponse(conn net.Conn) error {
-	body := `{"status":"ok"}`
-	response := "HTTP/1.1 200 OK\r\n" +
-		"Content-Type: application/json\r\n" +
-		"Content-Length: " + strconv.Itoa(len(body)) + "\r\n" +
-		"Connection: close\r\n\r\n" +
-		body
-	_, err := conn.Write([]byte(response))
-	return err
-}
-
 func broadcastJoin(state PlayerState) {
 	mu.RLock()
 	defer mu.RUnlock()
 
 	for _, c := range clients {
-		if c == nil || c.Conn == nil {
-			continue
-		}
-		if err := sendPacket(c.Conn, Packet{Type: "join", Player: state}); err != nil {
-			fmt.Println("Gui join loi:", err)
-		}
+		sendPacket(c.Conn, Packet{Type: "join", Player: state})
 	}
 }
 
@@ -280,12 +257,7 @@ func broadcastState(state PlayerState) {
 	defer mu.RUnlock()
 
 	for _, c := range clients {
-		if c == nil || c.Conn == nil {
-			continue
-		}
-		if err := sendPacket(c.Conn, Packet{Type: "state", Player: state}); err != nil {
-			fmt.Println("Gui state loi:", err)
-		}
+		sendPacket(c.Conn, Packet{Type: "state", Player: state})
 	}
 }
 
@@ -294,12 +266,7 @@ func broadcastLeave(playerID string) {
 	defer mu.RUnlock()
 
 	for _, c := range clients {
-		if c == nil || c.Conn == nil {
-			continue
-		}
-		if err := sendPacket(c.Conn, Packet{Type: "leave", Player: PlayerState{ID: playerID}}); err != nil {
-			fmt.Println("Gui leave loi:", err)
-		}
+		sendPacket(c.Conn, Packet{Type: "leave", Player: PlayerState{ID: playerID}})
 	}
 }
 
@@ -308,21 +275,16 @@ func broadcastDamage(attackerID string, targetID string, damage float64) {
 	defer mu.RUnlock()
 
 	for _, c := range clients {
-		if c == nil || c.Conn == nil {
-			continue
-		}
-		if err := sendPacket(c.Conn, Packet{
+		sendPacket(c.Conn, Packet{
 			Type:       "damage",
 			AttackerID: attackerID,
 			TargetID:   targetID,
 			Damage:     damage,
-		}); err != nil {
-			fmt.Println("Gui damage loi:", err)
-		}
+		})
 	}
 }
 
-func sendSnapshot(conn net.Conn, roomID string, matchID string) error {
+func sendSnapshot(conn *websocket.Conn, roomID string, matchID string) error {
 	players, err := store.Snapshot(roomID, matchID)
 	if err != nil {
 		return err
@@ -330,12 +292,10 @@ func sendSnapshot(conn net.Conn, roomID string, matchID string) error {
 	return sendPacket(conn, Packet{Type: "snapshot", Players: players})
 }
 
-func sendPacket(conn net.Conn, packet Packet) error {
+func sendPacket(conn *websocket.Conn, packet Packet) error {
 	data, err := json.Marshal(packet)
 	if err != nil {
 		return err
 	}
-	data = append(data, '\n')
-	_, err = conn.Write(data)
-	return err
+	return conn.WriteMessage(websocket.TextMessage, data)
 }
